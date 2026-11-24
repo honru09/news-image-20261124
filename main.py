@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""news-image-20261124 entrypoint.
+"""Copy entrypoint for the news-image-20261124 make.fun entry.
 
-Copies the pre-built infographic entry.png (1024x1024, one page summing up
-the world news of Tuesday 24 November 2026) to <output dir>/entry.png.
+Stdlib only. Copies the bundled ``entry.png`` (which must be a
+1024x1024 PNG of at most 1 MiB) into the output directory as
+``entry.png``. The output directory defaults to ``/output`` and can be
+overridden with the ``MAKEFUN_OUTPUT_DIR`` environment variable.
 
-Deterministic: the output is a byte-for-byte copy of the committed image,
-so repeated runs always produce identical bytes. Before copying, the
-image is validated: PNG signature, IHDR 1024x1024 canvas, a 1 MiB size
-guard, and a CRC32 check on every PNG chunk. No network, no randomness,
-no clock reads.
+Before writing, the output directory's existing contents are removed
+(the directory itself is never deleted). The source image is validated
+first: PNG magic bytes, IHDR dimensions of exactly 1024x1024, a CRC32
+check over every chunk through IEND, and the 1 MiB size guard. Any
+failed check exits non-zero without writing an output file.
 """
 
 import os
@@ -18,107 +20,100 @@ import sys
 import zlib
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+MAX_BYTES = 1024 * 1024
 EXPECTED_WIDTH = 1024
 EXPECTED_HEIGHT = 1024
-MAX_FILE_SIZE = 1024 * 1024  # 1 MiB size guard on the source image
 
 
 def fail(message):
-    sys.stderr.write("error: %s\n" % message)
-    return 1
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
 
 
-def clear_contents(target_dir):
-    """Remove everything inside target_dir, leaving the directory itself."""
-    for name in os.listdir(target_dir):
-        path = os.path.join(target_dir, name)
-        if os.path.isdir(path) and not os.path.islink(path):
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
+def validate_png(data):
+    """Validate the bundled image; exit 1 on the first problem found."""
+    if len(data) > MAX_BYTES:
+        fail(f"source image is {len(data)} bytes, over the 1 MiB limit")
+    if len(data) < 8 or data[:8] != PNG_MAGIC:
+        fail("source image does not start with the PNG magic bytes")
+    if len(data) < 33:
+        fail("source image is too short to contain an IHDR chunk")
 
-
-def validate_chunk_crcs(data):
-    """Walk every PNG chunk and verify its CRC32 (over type + data).
-
-    Returns an error string, or None if the whole chunk stream is intact
-    and ends in an IEND chunk. A truncated or mis-CRC'd chunk means the
-    committed entry.png is corrupt and must not be shipped.
-    """
-    offset = 8  # skip the PNG signature
+    offset = 8
+    seen_ihdr = False
     seen_iend = False
     while offset < len(data):
         if offset + 8 > len(data):
-            return "truncated PNG chunk header"
+            fail("truncated PNG chunk header")
         length = struct.unpack(">I", data[offset:offset + 4])[0]
         chunk_type = data[offset + 4:offset + 8]
-        chunk_start = offset + 8
-        chunk_end = chunk_start + length
-        if chunk_end + 4 > len(data):
-            return "truncated PNG chunk %r" % chunk_type.decode("ascii", "replace")
-        stored_crc = struct.unpack(">I", data[chunk_end:chunk_end + 4])[0]
+        body_start = offset + 8
+        body_end = body_start + length
+        if body_end + 4 > len(data):
+            fail(f"truncated PNG chunk {chunk_type!r}")
+        chunk_data = data[body_start:body_end]
+        stored_crc = struct.unpack(">I", data[body_end:body_end + 4])[0]
         actual_crc = zlib.crc32(chunk_type)
-        actual_crc = zlib.crc32(data[chunk_start:chunk_end], actual_crc)
+        actual_crc = zlib.crc32(chunk_data, actual_crc)
         if actual_crc != stored_crc:
-            return "PNG chunk %r has a bad CRC" % chunk_type.decode("ascii", "replace")
-        offset = chunk_end + 4
+            fail(f"PNG chunk {chunk_type.decode('latin-1')} has a bad CRC")
+        if chunk_type == b"IHDR":
+            if seen_ihdr:
+                fail("duplicate IHDR chunk")
+            seen_ihdr = True
+            if length != 13:
+                fail("IHDR chunk has the wrong length")
+            width, height = struct.unpack(">II", chunk_data[:8])
+            if width != EXPECTED_WIDTH or height != EXPECTED_HEIGHT:
+                fail(
+                    f"image is {width}x{height}, "
+                    f"expected {EXPECTED_WIDTH}x{EXPECTED_HEIGHT}"
+                )
         if chunk_type == b"IEND":
             seen_iend = True
+            if body_end + 4 != len(data):
+                fail("trailing data after IEND chunk")
             break
+        offset = body_end + 4
+    if not seen_ihdr:
+        fail("PNG has no IHDR chunk")
     if not seen_iend:
-        return "PNG file is missing its IEND chunk"
-    if offset != len(data):
-        return "trailing data after PNG IEND chunk"
-    return None
+        fail("PNG has no IEND chunk")
+
+
+def clear_output_dir(path):
+    """Remove everything inside path, leaving path itself in place."""
+    os.makedirs(path, exist_ok=True)
+    for name in os.listdir(path):
+        target = os.path.join(path, name)
+        if os.path.isdir(target) and not os.path.islink(target):
+            shutil.rmtree(target)
+        else:
+            os.unlink(target)
 
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     source = os.path.join(here, "entry.png")
-    target_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    target = os.path.join(target_dir, "entry.png")
+    try:
+        with open(source, "rb") as handle:
+            data = handle.read()
+    except OSError as exc:
+        fail(f"cannot read bundled entry.png: {exc}")
 
-    if not os.path.isfile(source):
-        return fail("missing expected image file: %s" % source)
+    validate_png(data)
 
-    with open(source, "rb") as handle:
-        data = handle.read()
-
-    # Guard against an unexpectedly large source image.
-    if len(data) > MAX_FILE_SIZE:
-        return fail("entry.png is %d bytes, over the %d-byte limit"
-                    % (len(data), MAX_FILE_SIZE))
-
-    # The file must be a real PNG: 8-byte signature followed by an IHDR
-    # chunk declaring the expected 1024x1024 canvas. Anything else means
-    # the committed entry.png is corrupt or was replaced by the wrong file.
-    if len(data) < 24 or data[:8] != PNG_MAGIC:
-        return fail("entry.png is not a valid PNG file "
-                    "(bad or missing PNG signature)")
-
-    if data[12:16] != b"IHDR":
-        return fail("entry.png is not a valid PNG file "
-                    "(first chunk is not IHDR)")
-
-    width, height = struct.unpack(">II", data[16:24])
-    if (width, height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
-        return fail("entry.png has wrong size %dx%d, expected %dx%d"
-                    % (width, height, EXPECTED_WIDTH, EXPECTED_HEIGHT))
-
-    # Every chunk's CRC must check out before the image is copied.
-    crc_error = validate_chunk_crcs(data)
-    if crc_error is not None:
-        return fail("entry.png failed PNG integrity check: %s" % crc_error)
-
-    os.makedirs(target_dir, exist_ok=True)
-    clear_contents(target_dir)
-
-    with open(target, "wb") as handle:
-        handle.write(data)
-    os.chmod(target, 0o644)
-
-    return 0
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    clear_output_dir(output_dir)
+    destination = os.path.join(output_dir, "entry.png")
+    try:
+        with open(destination, "wb") as handle:
+            handle.write(data)
+        os.chmod(destination, 0o644)
+    except OSError as exc:
+        fail(f"cannot write output image: {exc}")
+    print(f"wrote {destination} ({len(data)} bytes)")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
