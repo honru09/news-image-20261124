@@ -1,0 +1,7 @@
+kit/
+*.tar.gz
+TASK.md
+PROGRESS.md
+REPORT.md
+build.py
+news-image-20261123-kit/
